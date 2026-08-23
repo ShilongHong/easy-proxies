@@ -75,7 +75,7 @@ func TestVerifyRuntimeRetriesPortsThatBecomeReady(t *testing.T) {
 
 	listenerReady := make(chan net.Listener, 1)
 	go func() {
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 		listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", fmt.Sprint(port)))
 		if err == nil {
 			listenerReady <- listener
@@ -90,6 +90,102 @@ func TestVerifyRuntimeRetriesPortsThatBecomeReady(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatalf("VerifyRuntime() rejected a port that became ready: %v", err)
+	}
+}
+
+func TestReassignConflictingPortSkipsConsecutiveOccupiedPorts(t *testing.T) {
+	cfg := &config.Config{
+		Mode:      "multi-port",
+		MultiPort: config.MultiPortConfig{Address: "127.0.0.1"},
+		Nodes: []config.NodeConfig{
+			{Name: "conflict", Port: 30000},
+			{Name: "used", Port: 30003},
+		},
+	}
+	available := func(_ string, port uint16) bool {
+		return port != 30001 && port != 30002
+	}
+	if !reassignConflictingPortWithAvailability(cfg, 30000, available) {
+		t.Fatal("reassignConflictingPortWithAvailability() returned false")
+	}
+	if got := cfg.Nodes[0].Port; got != 30004 {
+		t.Fatalf("reassigned port = %d, want 30004", got)
+	}
+}
+
+func TestReassignConflictingPortDoesNotOverflowAtMaxPort(t *testing.T) {
+	cfg := &config.Config{
+		Mode:      "multi-port",
+		MultiPort: config.MultiPortConfig{Address: "127.0.0.1"},
+		Nodes:     []config.NodeConfig{{Name: "max", Port: 65535}},
+	}
+	if reassignConflictingPortWithAvailability(cfg, 65535, func(string, uint16) bool { return true }) {
+		t.Fatal("reassignConflictingPortWithAvailability() reassigned beyond port 65535")
+	}
+	if got := cfg.Nodes[0].Port; got != 65535 {
+		t.Fatalf("port changed after failed reassignment: %d", got)
+	}
+}
+
+func TestRebuildPortAssignmentsSkipsExternallyOccupiedPort(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	occupied := uint16(listener.Addr().(*net.TCPAddr).Port)
+	cfg := &config.Config{
+		Mode:      "multi-port",
+		MultiPort: config.MultiPortConfig{Address: "127.0.0.1", BasePort: occupied},
+		Nodes:     []config.NodeConfig{{Name: "node", URI: "socks5://127.0.0.1:1"}},
+	}
+	manager := New(cfg, monitor.Config{})
+	if err := manager.RebuildPortAssignments(); err != nil {
+		t.Fatalf("RebuildPortAssignments() error = %v", err)
+	}
+	if got := cfg.Nodes[0].Port; got == 0 || got == occupied {
+		t.Fatalf("assigned port = %d, occupied port = %d", got, occupied)
+	}
+}
+
+func TestNextAvailablePortReturnsZeroWhenPortRangeIsExhausted(t *testing.T) {
+	manager := &Manager{cfg: &config.Config{
+		Mode:      "multi-port",
+		MultiPort: config.MultiPortConfig{Address: "127.0.0.1", BasePort: 65535},
+		Nodes:     []config.NodeConfig{{Name: "max", Port: 65535}},
+	}}
+	manager.mu.Lock()
+	got := manager.nextAvailablePortLocked()
+	manager.mu.Unlock()
+	if got != 0 {
+		t.Fatalf("nextAvailablePortLocked() = %d, want 0 when exhausted", got)
+	}
+}
+
+func TestRebuildPortAssignmentsPersistsPorts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	cfg := &config.Config{
+		Mode:      "multi-port",
+		MultiPort: config.MultiPortConfig{Address: "127.0.0.1", BasePort: freePort(t)},
+		Nodes: []config.NodeConfig{
+			{Name: "first", URI: "socks5://127.0.0.1:1", Port: 25000, Source: config.NodeSourceInline},
+			{Name: "second", URI: "socks5://127.0.0.1:2", Port: 25001, Source: config.NodeSourceInline},
+		},
+	}
+	cfg.SetFilePath(path)
+	if err := cfg.SaveFull(); err != nil {
+		t.Fatalf("SaveFull() error = %v", err)
+	}
+	manager := New(cfg, monitor.Config{})
+	if err := manager.RebuildPortAssignments(); err != nil {
+		t.Fatalf("RebuildPortAssignments() error = %v", err)
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(loaded.Nodes) != 2 || loaded.Nodes[0].Port != cfg.Nodes[0].Port || loaded.Nodes[1].Port != cfg.Nodes[1].Port {
+		t.Fatalf("loaded ports = %#v, runtime ports = %#v", loaded.Nodes, cfg.Nodes)
 	}
 }
 

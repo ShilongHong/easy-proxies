@@ -1,12 +1,14 @@
 package builder
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/outbound/dispatch"
 	poolout "easy_proxies/internal/outbound/pool"
+	"easy_proxies/internal/proxychain"
 )
 
 func TestBuildMultiPortUsesDirectOutboundsAndDispatch(t *testing.T) {
@@ -67,6 +69,39 @@ func TestBuildMultiPortUsesDirectOutboundsAndDispatch(t *testing.T) {
 	}
 	if dispatchOptions == nil || len(dispatchOptions.Mappings) != len(cfg.Nodes) {
 		t.Fatalf("dispatcher mappings = %#v", dispatchOptions)
+	}
+}
+
+func TestValidateNodeConfigsReportsBuildFailuresWithoutURIs(t *testing.T) {
+	cfg := &config.Config{
+		Mode: "multi-port",
+		Nodes: []config.NodeConfig{
+			{Name: "valid", URI: "http://127.0.0.1:18001", Port: 12001},
+			{Name: "invalid", URI: "unsupported://127.0.0.1:18002", Port: 12002},
+		},
+	}
+	failures := ValidateNodeConfigs(cfg)
+	if len(failures) != 1 || failures[0].Name != "invalid" || failures[0].Port != 12002 {
+		t.Fatalf("failures = %#v, want one failure for invalid node", failures)
+	}
+	if strings.Contains(failures[0].Reason, "18002") {
+		t.Fatalf("failure reason exposes node endpoint: %q", failures[0].Reason)
+	}
+}
+
+func TestValidateNodeConfigsUsesTheRuntimeChainShape(t *testing.T) {
+	cfg := &config.Config{
+		Mode: "multi-port",
+		ChainProfiles: []proxychain.Profile{{
+			ID: "front", Name: "front", Enabled: true,
+			Hops: []proxychain.Hop{{URI: "http://127.0.0.1:18080"}},
+		}},
+		Nodes: []config.NodeConfig{{
+			Name: "terminal", URI: "http://127.0.0.1:18081", Port: 12001, ChainProfileID: "front",
+		}},
+	}
+	if failures := ValidateNodeConfigs(cfg); len(failures) != 0 {
+		t.Fatalf("chain validation failures = %#v", failures)
 	}
 }
 

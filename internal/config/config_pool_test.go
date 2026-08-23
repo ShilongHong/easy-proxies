@@ -39,6 +39,34 @@ func TestModeNormalization(t *testing.T) {
 	}
 }
 
+func TestNormalizeWithPortMapDoesNotWrapPastMaxPort(t *testing.T) {
+	cfg := &Config{
+		Mode:      "multi-port",
+		MultiPort: MultiPortConfig{Address: "127.0.0.1", BasePort: 65535},
+		Nodes: []NodeConfig{
+			{Name: "first", URI: "socks5://127.0.0.1:1"},
+			{Name: "second", URI: "socks5://127.0.0.1:2"},
+		},
+	}
+	if err := cfg.NormalizeWithPortMap(nil); err == nil {
+		t.Fatal("NormalizeWithPortMap() succeeded after exhausting port 65535")
+	}
+	for _, node := range cfg.Nodes {
+		if node.Port == 0 && node.Name == "first" {
+			continue
+		}
+		if node.Port > 0 && node.Port < 65535 {
+			t.Fatalf("port allocation wrapped to %d", node.Port)
+		}
+	}
+}
+
+func TestIsPortAvailableRejectsZero(t *testing.T) {
+	if IsPortAvailable("127.0.0.1", 0) {
+		t.Fatal("IsPortAvailable() accepted port 0")
+	}
+}
+
 func TestExampleConfig(t *testing.T) {
 	cfg, err := Load(filepath.Join("..", "..", "config.example.yaml"))
 	if err != nil {

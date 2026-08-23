@@ -252,7 +252,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 	if len(failedNodes) > 0 {
 		log.Printf("⚠️  %d/%d nodes failed and were skipped: %v", len(failedNodes), len(cfg.Nodes), failedNodes)
 	}
-	log.Printf("✅ Successfully built %d/%d nodes", len(baseOutbounds), len(cfg.Nodes))
+	log.Printf("✅ Successfully built %d/%d nodes", len(memberTags), len(cfg.Nodes))
 
 	// Log GeoIP region distribution
 	if cfg.GeoIP.Enabled {

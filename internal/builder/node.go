@@ -6,11 +6,72 @@ import (
 	"strings"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/proxychain"
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/auth"
 )
+
+type NodeValidationFailure struct {
+	Name   string
+	Port   uint16
+	Reason string
+}
+
+func ValidateNodeConfig(cfg *config.Config, node config.NodeConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("config is nil")
+	}
+	tag := NodeTag(node.Name)
+	if tag == "" {
+		tag = "node-validation"
+	}
+	if strings.TrimSpace(node.ChainProfileID) == "" {
+		_, err := buildNodeOutbound(tag, node.URI, cfg.SkipCertVerify)
+		return err
+	}
+	profile, ok := proxychain.Find(cfg.ChainProfiles, node.ChainProfileID)
+	if !ok || !profile.Enabled {
+		return fmt.Errorf("chain profile %q is missing or disabled", node.ChainProfileID)
+	}
+	if len(profile.Hops) == 0 {
+		return fmt.Errorf("chain profile %q has no hops", profile.Name)
+	}
+	hops := make([]string, 0, len(profile.Hops))
+	for _, hop := range profile.Hops {
+		hops = append(hops, hop.URI)
+	}
+	chainOutbounds, err := BuildChainOutbounds(tag+"-baseline", hops[len(hops)-1], hops[:len(hops)-1], cfg.SkipCertVerify)
+	if err != nil {
+		return err
+	}
+	terminal, err := buildNodeOutbound(tag, node.URI, cfg.SkipCertVerify)
+	if err != nil {
+		return err
+	}
+	if err := validateDetourTransport(node.URI, hops[len(hops)-1]); err != nil {
+		return err
+	}
+	return SetOutboundDetour(&terminal, chainOutbounds[len(chainOutbounds)-1].Tag)
+}
+
+func ValidateNodeConfigs(cfg *config.Config) []NodeValidationFailure {
+	if cfg == nil {
+		return []NodeValidationFailure{{Reason: "config is nil"}}
+	}
+	failures := make([]NodeValidationFailure, 0)
+	for _, node := range cfg.Nodes {
+		if err := ValidateNodeConfig(cfg, node); err != nil {
+			failures = append(failures, NodeValidationFailure{
+				Name:   node.Name,
+				Port:   node.Port,
+				Reason: err.Error(),
+			})
+		}
+	}
+	return failures
+}
 
 func BuildSingleNodeOutbound(tag, uri string, skipCertVerify bool) (option.Outbound, error) {
 	return buildNodeOutbound(tag, uri, skipCertVerify)

@@ -39,6 +39,7 @@ type batchNodeManagerStub struct {
 	verifyRelease  chan struct{}
 	verifyErr      error
 	verifyCount    int
+	validationErrs map[string]error
 }
 
 func (m *batchNodeManagerStub) CreateNode(ctx context.Context, node config.NodeConfig) (config.NodeConfig, error) {
@@ -225,6 +226,35 @@ func (m *batchNodeManagerStub) VerifyRuntime(ctx context.Context) error {
 		}
 	}
 	return m.verifyErr
+}
+
+func (m *batchNodeManagerStub) ValidateNode(ctx context.Context, node config.NodeConfig) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if m.validationErrs == nil {
+		return nil
+	}
+	return m.validationErrs[node.Name]
+}
+
+func TestPreflightRuntimeNodesDemotesOnlyInvalidCandidates(t *testing.T) {
+	mgr := &batchNodeManagerStub{validationErrs: map[string]error{"bad": errors.New("unsupported transport")}}
+	svc, _ := newBatchServiceForTest(t, mgr)
+	updates := map[string]ManagedNode{
+		"good": {ID: "good", Name: "good", URI: "http://good:80", State: StatePassed},
+		"bad":  {ID: "bad", Name: "bad", URI: "http://bad:80", State: StatePassed, Port: 24001},
+	}
+	before := map[string]ManagedNode{}
+	touched := map[string]struct{}{"good": {}, "bad": {}}
+	var toDelete []string
+	svc.preflightRuntimeNodes(context.Background(), updates, before, touched, &toDelete)
+	if updates["good"].State != StatePassed || updates["bad"].State != StateFailed || updates["bad"].InPool || updates["bad"].Port != 0 {
+		t.Fatalf("updates = %#v", updates)
+	}
+	if !strings.Contains(updates["bad"].LastError, "运行配置构建失败") {
+		t.Fatalf("bad.LastError = %q", updates["bad"].LastError)
+	}
 }
 
 func newBatchServiceForTest(t *testing.T, mgr *batchNodeManagerStub) (*Service, *Store) {
@@ -1865,6 +1895,25 @@ func TestEnsurePoolRuntimeConsistencyRemovesConfigDrift(t *testing.T) {
 	}
 	if mgr.restoreCount != 1 || len(mgr.configNodes) != 1 || mgr.configNodes[0].URI != poolNode.URI {
 		t.Fatalf("restoreCount=%d configNodes=%#v", mgr.restoreCount, mgr.configNodes)
+	}
+}
+
+func TestVerifyAppliedRuntimeSynchronizesReassignedPort(t *testing.T) {
+	poolNode := ManagedNode{ID: "pool", Name: "old-name", URI: "trojan://pool", State: StateInPool, InPool: true, Enabled: true, Port: 24000}
+	mgr := &batchNodeManagerStub{configNodes: []config.NodeConfig{{Name: "runtime-name", URI: poolNode.URI, Port: 24005}}}
+	svc, store := newBatchServiceForTest(t, mgr)
+	if err := store.UpsertNode(poolNode); err != nil {
+		t.Fatalf("UpsertNode() error = %v", err)
+	}
+	if err := svc.verifyAppliedRuntime(context.Background()); err != nil {
+		t.Fatalf("verifyAppliedRuntime() error = %v", err)
+	}
+	updated, ok := store.GetNode(poolNode.ID)
+	if !ok {
+		t.Fatal("pool node disappeared")
+	}
+	if updated.Port != 24005 || updated.Name != "runtime-name" {
+		t.Fatalf("node = %#v, want synchronized runtime port/name", updated)
 	}
 }
 

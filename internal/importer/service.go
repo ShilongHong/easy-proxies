@@ -75,6 +75,10 @@ type NodeRuntimeVerifier interface {
 	VerifyRuntime(ctx context.Context) error
 }
 
+type NodeRuntimeValidator interface {
+	ValidateNode(ctx context.Context, node config.NodeConfig) error
+}
+
 type Service struct {
 	store      *Store
 	tester     *NodeTester
@@ -1270,6 +1274,7 @@ func (s *Service) applyStagedNodes(ctx context.Context, tagPrefix string, revisi
 	for id, node := range stagedByID {
 		updates[id] = node
 	}
+	s.preflightRuntimeNodes(ctx, updates, beforeNodes, touchedIDs, &poolNamesToDelete)
 	rollback := func(cause error) error {
 		upserts := make([]ManagedNode, 0, len(beforeNodes))
 		deletes := make([]string, 0, len(touchedIDs)-len(beforeNodes))
@@ -1336,6 +1341,34 @@ func (s *Service) applyStagedNodes(ctx context.Context, tagPrefix string, revisi
 	return len(created), nil
 }
 
+func (s *Service) preflightRuntimeNodes(ctx context.Context, updates map[string]ManagedNode, beforeNodes map[string]ManagedNode, touchedIDs map[string]struct{}, poolNamesToDelete *[]string) {
+	validator, ok := s.nodeMgr.(NodeRuntimeValidator)
+	if !ok {
+		return
+	}
+	for id, node := range updates {
+		if _, touched := touchedIDs[id]; !touched {
+			continue
+		}
+		if node.State != StatePassed && node.State != StateInPool && !node.InPool {
+			continue
+		}
+		if err := validator.ValidateNode(ctx, node.ToConfigNode()); err == nil {
+			continue
+		} else {
+			if current, exists := beforeNodes[id]; exists && (current.InPool || current.State == StateInPool) && strings.TrimSpace(current.Name) != "" {
+				*poolNamesToDelete = append(*poolNamesToDelete, current.Name)
+			}
+			node.State = StateFailed
+			node.InPool = false
+			node.Port = 0
+			node.LastError = "运行配置构建失败: " + err.Error()
+			node.UpdatedAt = time.Now()
+			updates[id] = node
+		}
+	}
+}
+
 func (s *Service) reloadAndVerify(ctx context.Context, onVerify func()) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1368,9 +1401,37 @@ func (s *Service) verifyAppliedRuntime(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("读取运行节点: %w", err)
 	}
-	poolCount := len(s.store.ListPoolNodes())
-	if len(configured) != poolCount {
-		return fmt.Errorf("节点池与运行端口数量不一致: 节点池 %d，运行配置 %d", poolCount, len(configured))
+	pool := s.store.ListPoolNodes()
+	if len(configured) != len(pool) {
+		return fmt.Errorf("节点池与运行端口数量不一致: 节点池 %d，运行配置 %d", len(pool), len(configured))
+	}
+	byRoute := make(map[string]config.NodeConfig, len(configured))
+	for _, node := range configured {
+		key := node.URI + "\x00" + node.ChainProfileID
+		if _, exists := byRoute[key]; exists {
+			return fmt.Errorf("运行配置包含重复节点")
+		}
+		byRoute[key] = node
+	}
+	updates := make([]ManagedNode, 0)
+	for _, node := range pool {
+		configuredNode, exists := byRoute[node.URI+"\x00"+node.ChainProfileID]
+		if !exists {
+			return fmt.Errorf("运行配置缺少节点池成员")
+		}
+		if configuredNode.Port == 0 {
+			return fmt.Errorf("运行配置包含无效端口")
+		}
+		if node.Port != configuredNode.Port || node.Name != configuredNode.Name {
+			node.Port = configuredNode.Port
+			node.Name = configuredNode.Name
+			updates = append(updates, node)
+		}
+	}
+	if len(updates) > 0 {
+		if err := s.store.UpsertNodes(updates); err != nil {
+			return fmt.Errorf("同步运行端口到节点池: %w", err)
+		}
 	}
 	return nil
 }
@@ -4292,11 +4353,11 @@ func (s *Service) syncRuntimeNodes(nodes []ManagedNode) []ManagedNode {
 	if err != nil {
 		return nodes
 	}
-	byURI := make(map[string]config.NodeConfig, len(configNodes))
+	byRoute := make(map[string]config.NodeConfig, len(configNodes))
 	byName := make(map[string]config.NodeConfig, len(configNodes))
 	for _, cn := range configNodes {
 		if cn.URI != "" {
-			byURI[cn.URI] = cn
+			byRoute[cn.URI+"\x00"+cn.ChainProfileID] = cn
 		}
 		if cn.Name != "" {
 			byName[cn.Name] = cn
@@ -4306,7 +4367,7 @@ func (s *Service) syncRuntimeNodes(nodes []ManagedNode) []ManagedNode {
 		if !nodes[i].InPool && nodes[i].State != StateInPool {
 			continue
 		}
-		if cn, ok := byURI[nodes[i].URI]; ok {
+		if cn, ok := byRoute[nodes[i].URI+"\x00"+nodes[i].ChainProfileID]; ok {
 			nodes[i].Port = cn.Port
 			continue
 		}

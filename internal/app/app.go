@@ -115,6 +115,9 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		if err := boxMgr.RebuildPortAssignments(); err != nil {
 			return fmt.Errorf("rebuild port assignments: %w", err)
 		}
+		if err := syncPoolRuntimePorts(nodeStore, poolNodes, cfg.Nodes); err != nil {
+			return fmt.Errorf("sync rebuilt port assignments: %w", err)
+		}
 	}
 
 	testerOptions := []importer.TesterOption{
@@ -213,4 +216,31 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 
 	return nil
+}
+
+func syncPoolRuntimePorts(store *importer.Store, poolNodes []importer.ManagedNode, configNodes []config.NodeConfig) error {
+	if store == nil || len(poolNodes) == 0 {
+		return nil
+	}
+	byRoute := make(map[string]config.NodeConfig, len(configNodes))
+	for _, node := range configNodes {
+		byRoute[node.URI+"\x00"+node.ChainProfileID] = node
+	}
+	updates := make([]importer.ManagedNode, 0)
+	for _, node := range poolNodes {
+		configured, ok := byRoute[node.URI+"\x00"+node.ChainProfileID]
+		if !ok || configured.Port == 0 {
+			return fmt.Errorf("runtime port missing for pool node")
+		}
+		if node.Port == configured.Port && node.Name == configured.Name {
+			continue
+		}
+		node.Port = configured.Port
+		node.Name = configured.Name
+		updates = append(updates, node)
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+	return store.UpsertNodes(updates)
 }

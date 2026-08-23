@@ -360,7 +360,7 @@ func (c *Config) normalize() error {
 	if c.Mode == "hybrid" {
 		usedPorts[c.Listener.Port] = true
 	}
-	portCursor := c.MultiPort.BasePort
+	portCursor := uint32(c.MultiPort.BasePort)
 	if portCursor == 0 {
 		portCursor = 24000
 	}
@@ -401,15 +401,20 @@ func (c *Config) normalize() error {
 				}
 			}
 			if c.Nodes[idx].Port == 0 {
-				for usedPorts[portCursor] || !IsPortAvailable(c.MultiPort.Address, portCursor) {
-					log.Printf("⚠️  Port %d is in use, trying next port", portCursor)
-					portCursor++
-					if portCursor > 65535 {
-						return fmt.Errorf("no available ports found starting from %d", c.MultiPort.BasePort)
+				for portCursor <= 65535 {
+					candidate := uint16(portCursor)
+					if !usedPorts[candidate] && IsPortAvailable(c.MultiPort.Address, candidate) {
+						break
 					}
+					log.Printf("⚠️  Port %d is in use, trying next port", candidate)
+					portCursor++
 				}
-				c.Nodes[idx].Port = portCursor
-				usedPorts[portCursor] = true
+				if portCursor > 65535 {
+					return fmt.Errorf("no available ports found starting from %d", c.MultiPort.BasePort)
+				}
+				candidate := uint16(portCursor)
+				c.Nodes[idx].Port = candidate
+				usedPorts[candidate] = true
 				portCursor++
 			}
 			if c.Nodes[idx].Username == "" {
@@ -420,7 +425,10 @@ func (c *Config) normalize() error {
 		}
 
 		if c.Nodes[idx].Port == 0 {
-			c.Nodes[idx].Port = portCursor
+			if portCursor > 65535 {
+				return fmt.Errorf("no available ports found starting from %d", c.MultiPort.BasePort)
+			}
+			c.Nodes[idx].Port = uint16(portCursor)
 			portCursor++
 		}
 	}
@@ -526,7 +534,7 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	if c.Mode == "hybrid" {
 		usedPorts[c.Listener.Port] = true
 	}
-	portCursor := c.MultiPort.BasePort
+	portCursor := uint32(c.MultiPort.BasePort)
 	if portCursor == 0 {
 		portCursor = 24000
 	}
@@ -583,19 +591,27 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	for idx := range c.Nodes {
 		if c.Nodes[idx].Port == 0 && (c.Mode == "multi-port" || c.Mode == "hybrid") {
 			// Find next available port that's not used
-			for usedPorts[portCursor] || !IsPortAvailable(c.MultiPort.Address, portCursor) {
-				log.Printf("⚠️  Port %d is in use, trying next port", portCursor)
-				portCursor++
-				if portCursor > 65535 {
-					return fmt.Errorf("no available ports found starting from %d", c.MultiPort.BasePort)
+			for portCursor <= 65535 {
+				candidate := uint16(portCursor)
+				if !usedPorts[candidate] && IsPortAvailable(c.MultiPort.Address, candidate) {
+					break
 				}
+				log.Printf("⚠️  Port %d is in use, trying next port", candidate)
+				portCursor++
 			}
-			c.Nodes[idx].Port = portCursor
-			usedPorts[portCursor] = true
-			log.Printf("📌 Assigned new port %d for node %q", portCursor, c.Nodes[idx].Name)
+			if portCursor > 65535 {
+				return fmt.Errorf("no available ports found starting from %d", c.MultiPort.BasePort)
+			}
+			candidate := uint16(portCursor)
+			c.Nodes[idx].Port = candidate
+			usedPorts[candidate] = true
+			log.Printf("📌 Assigned new port %d for node %q", candidate, c.Nodes[idx].Name)
 			portCursor++
 		} else if c.Nodes[idx].Port == 0 {
-			c.Nodes[idx].Port = portCursor
+			if portCursor > 65535 {
+				return fmt.Errorf("no available ports found starting from %d", c.MultiPort.BasePort)
+			}
+			c.Nodes[idx].Port = uint16(portCursor)
 			portCursor++
 		}
 
@@ -1506,6 +1522,9 @@ func (c *Config) SaveSettings() error {
 
 // IsPortAvailable checks if a port is available for binding.
 func IsPortAvailable(address string, port uint16) bool {
+	if port == 0 {
+		return false
+	}
 	addr := fmt.Sprintf("%s:%d", address, port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
