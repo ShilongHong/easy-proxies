@@ -7,10 +7,12 @@ import (
 	"log"
 	"net"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"easy_proxies/internal/builder"
@@ -235,8 +237,11 @@ func WithLogger(l Logger) Option {
 
 // Manager owns the lifecycle of the active sing-box instance.
 type Manager struct {
-	mu       sync.RWMutex
-	reloadMu sync.Mutex
+	mu        sync.RWMutex
+	reloadMu  sync.Mutex
+	closing   bool
+	closeDone chan struct{}
+	closeErr  error
 
 	currentBox    *box.Box
 	monitorMgr    *monitor.Manager
@@ -250,6 +255,7 @@ type Manager struct {
 	logger            Logger
 
 	baseCtx   context.Context
+	cancel    context.CancelFunc
 	portIndex atomic.Value
 
 	runtimeCfg        *config.Config
@@ -280,6 +286,12 @@ func New(cfg *config.Config, monitorCfg monitor.Config, opts ...Option) *Manager
 
 // Start creates and starts the initial sing-box instance.
 func (m *Manager) Start(ctx context.Context) error {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	return m.startLocked(ctx)
+}
+
+func (m *Manager) startLocked(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -288,6 +300,10 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 
 	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return errors.New("box manager is closed")
+	}
 	if m.cfg == nil {
 		m.mu.Unlock()
 		return errors.New("box manager requires config")
@@ -297,7 +313,9 @@ func (m *Manager) Start(ctx context.Context) error {
 		return errors.New("sing-box already running")
 	}
 	m.applyConfigSettings(m.cfg)
-	m.baseCtx = ctx
+	if m.baseCtx != nil {
+		ctx = m.baseCtx
+	}
 	cfg := m.cfg
 	m.mu.Unlock()
 	if len(cfg.Nodes) == 0 {
@@ -316,7 +334,7 @@ func (m *Manager) Start(ctx context.Context) error {
 			return err
 		}
 		if err = instance.Start(); err != nil {
-			_ = instance.Close()
+			m.closeRuntimeInstance(instance)
 			// Check if it's a port conflict error
 			if conflictPort := extractPortFromBindError(err); conflictPort > 0 {
 				m.logger.Warnf("port %d is in use, reassigning and retrying...", conflictPort)
@@ -336,13 +354,18 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	if portsChanged && cfg.FilePath() != "" {
 		if err := cfg.Save(); err != nil {
-			_ = instance.Close()
+			m.closeRuntimeInstance(instance)
 			return fmt.Errorf("save reassigned ports: %w", err)
 		}
 	}
 	m.storePortIndex(cfg)
 
 	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		m.closeRuntimeInstance(instance)
+		return errors.New("box manager is closed")
+	}
 	m.currentBox = instance
 	m.runtimeCfg = cloneConfig(cfg)
 	m.mu.Unlock()
@@ -373,6 +396,10 @@ func (m *Manager) reloadLocked(newCfg *config.Config) error {
 	}
 
 	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return errors.New("box manager is closed")
+	}
 	if m.currentBox == nil {
 		m.mu.Unlock()
 		return errors.New("manager not started")
@@ -402,13 +429,14 @@ func (m *Manager) reloadLocked(newCfg *config.Config) error {
 		m.runtimeContexts.Delete(oldBox)
 	}
 
-	// Stop GeoIP router before starting new box to release its port
+	// Stop GeoIP router before starting new box to release its port.
 	m.mu.Lock()
-	if m.geoRouter != nil {
-		m.geoRouter.Stop()
-		m.geoRouter = nil
-	}
+	oldRouter := m.geoRouter
+	m.geoRouter = nil
 	m.mu.Unlock()
+	if oldRouter != nil {
+		_ = oldRouter.Stop()
+	}
 
 	if err := m.rebuildMultiPortAssignments(newCfg); err != nil {
 		m.rollbackToOldConfig(ctx, oldCfg)
@@ -445,7 +473,7 @@ func (m *Manager) reloadLocked(newCfg *config.Config) error {
 			return fmt.Errorf("create new box: %w", err)
 		}
 		if err = instance.Start(); err != nil {
-			_ = instance.Close()
+			m.closeRuntimeInstance(instance)
 			// Check if it's a port conflict error
 			if conflictPort := extractPortFromBindError(err); conflictPort > 0 {
 				m.logger.Warnf("port %d is in use, reassigning and retrying...", conflictPort)
@@ -467,7 +495,7 @@ func (m *Manager) reloadLocked(newCfg *config.Config) error {
 	}
 	if portsChanged && newCfg.FilePath() != "" {
 		if err := newCfg.Save(); err != nil {
-			_ = instance.Close()
+			m.closeRuntimeInstance(instance)
 			m.rollbackToOldConfig(ctx, oldCfg)
 			return fmt.Errorf("save reassigned ports: %w", err)
 		}
@@ -476,6 +504,11 @@ func (m *Manager) reloadLocked(newCfg *config.Config) error {
 	m.applyConfigSettings(newCfg)
 
 	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		m.closeRuntimeInstance(instance)
+		return errors.New("box manager is closed")
+	}
 	m.currentBox = instance
 	m.cfg = newCfg
 	m.runtimeCfg = cloneConfig(newCfg)
@@ -495,11 +528,12 @@ func (m *Manager) reloadLocked(newCfg *config.Config) error {
 		m.startGeoIPRouter(ctx, newCfg)
 	} else {
 		m.mu.Lock()
-		if m.geoRouter != nil {
-			m.geoRouter.Stop()
-			m.geoRouter = nil
-		}
+		oldRouter := m.geoRouter
+		m.geoRouter = nil
 		m.mu.Unlock()
+		if oldRouter != nil {
+			_ = oldRouter.Stop()
+		}
 	}
 
 	return nil
@@ -536,7 +570,10 @@ func (m *Manager) configureHealthChecks(cfg *config.Config, reloaded bool) {
 
 // rollbackToOldConfig attempts to restart with the previous configuration.
 func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config) {
-	if oldCfg == nil {
+	m.mu.RLock()
+	closing := m.closing
+	m.mu.RUnlock()
+	if oldCfg == nil || closing || ctx.Err() != nil {
 		return
 	}
 	if oldCfg.FilePath() != "" {
@@ -551,11 +588,16 @@ func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config
 		return
 	}
 	if err := instance.Start(); err != nil {
-		_ = instance.Close()
+		m.closeRuntimeInstance(instance)
 		m.logger.Errorf("rollback failed to start box: %v", err)
 		return
 	}
 	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		m.closeRuntimeInstance(instance)
+		return
+	}
 	m.currentBox = instance
 	m.cfg = oldCfg
 	m.runtimeCfg = cloneConfig(oldCfg)
@@ -638,29 +680,88 @@ func (m *Manager) rebuildMultiPortAssignments(cfg *config.Config) error {
 
 // Close terminates the active instance and auxiliary components.
 func (m *Manager) Close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return m.CloseContext(ctx)
+}
 
-	var err error
-	if m.currentBox != nil {
-		m.runtimeContexts.Delete(m.currentBox)
-		err = m.currentBox.Close()
-		m.currentBox = nil
+func (m *Manager) CloseContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	if m.monitorServer != nil {
-		m.monitorServer.Shutdown(context.Background())
-		m.monitorServer = nil
+	m.mu.Lock()
+	if !m.closing {
+		m.closing = true
+		m.closeDone = make(chan struct{})
+		if m.cancel != nil {
+			m.cancel()
+		}
+		go m.shutdown(ctx)
 	}
-	if m.monitorMgr != nil {
-		m.monitorMgr.Stop()
-		m.monitorMgr = nil
+	done := m.closeDone
+	m.mu.Unlock()
+	select {
+	case <-done:
+		return m.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	if m.geoRouter != nil {
-		m.geoRouter.Stop()
-		m.geoRouter = nil
+}
+
+func (m *Manager) shutdown(ctx context.Context) {
+	m.mu.RLock()
+	server := m.monitorServer
+	m.mu.RUnlock()
+	var firstErr error
+	if server != nil {
+		shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			firstErr = err
+		}
+		cancel()
 	}
+
+	// HTTP handlers may need reloadMu. Drain/close HTTP before waiting for
+	// runtime operations, and never close a box while reconciliation uses it.
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	m.mu.Lock()
+	instance := m.currentBox
+	monitorMgr := m.monitorMgr
+	geoRouter := m.geoRouter
+	m.currentBox = nil
+	m.monitorMgr = nil
+	m.monitorServer = nil
+	m.geoRouter = nil
 	m.baseCtx = nil
-	return err
+	m.mu.Unlock()
+
+	if monitorMgr != nil {
+		monitorMgr.Stop()
+	}
+	if geoRouter != nil {
+		if err := geoRouter.Stop(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if instance != nil {
+		m.runtimeContexts.Delete(instance)
+		if err := instance.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	m.mu.Lock()
+	m.closeErr = firstErr
+	close(m.closeDone)
+	m.mu.Unlock()
+}
+
+func (m *Manager) closeRuntimeInstance(instance *box.Box) {
+	if instance == nil {
+		return
+	}
+	m.runtimeContexts.Delete(instance)
+	_ = instance.Close()
 }
 
 // MonitorManager returns the shared monitor manager.
@@ -688,11 +789,16 @@ func (m *Manager) EnsureMonitor(ctx context.Context) error {
 func (m *Manager) startGeoIPRouter(ctx context.Context, cfg *config.Config) {
 	// Stop existing router if any
 	m.mu.Lock()
-	if m.geoRouter != nil {
-		m.geoRouter.Stop()
-		m.geoRouter = nil
-	}
+	oldRouter := m.geoRouter
+	m.geoRouter = nil
+	closing := m.closing
 	m.mu.Unlock()
+	if oldRouter != nil {
+		_ = oldRouter.Stop()
+	}
+	if closing {
+		return
+	}
 
 	geoipPort := cfg.GeoIP.Port
 	if geoipPort == 0 {
@@ -740,6 +846,11 @@ func (m *Manager) startGeoIPRouter(ctx context.Context, cfg *config.Config) {
 	}
 
 	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		_ = router.Stop()
+		return
+	}
 	m.geoRouter = router
 	m.mu.Unlock()
 }
@@ -872,6 +983,11 @@ func (m *Manager) gracefulSwitch(newBox *box.Box) error {
 	}
 
 	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		m.closeRuntimeInstance(newBox)
+		return errors.New("box manager is closed")
+	}
 	old := m.currentBox
 	m.currentBox = newBox
 	drainTimeout := m.drainTimeout
@@ -893,6 +1009,7 @@ func (m *Manager) drainOldBox(oldBox *box.Box, timeout time.Duration) {
 	if timeout > 0 {
 		time.Sleep(timeout)
 	}
+	m.runtimeContexts.Delete(oldBox)
 	if err := oldBox.Close(); err != nil {
 		m.logger.Errorf("failed to close old instance: %v", err)
 		return
@@ -956,6 +1073,17 @@ func (m *Manager) availableNodeCount() (int, int) {
 // ensureMonitor initializes monitor manager and server if needed.
 func (m *Manager) ensureMonitor(ctx context.Context) error {
 	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return errors.New("box manager is closed")
+	}
+	if m.baseCtx == nil {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		m.baseCtx, m.cancel = context.WithCancel(ctx)
+	}
+	ctx = m.baseCtx
 	if m.monitorMgr != nil {
 		m.mu.Unlock()
 		return nil
@@ -1399,6 +1527,10 @@ func (m *Manager) triggerReloadLocked(ctx context.Context) error {
 	}
 
 	m.mu.RLock()
+	if m.closing {
+		m.mu.RUnlock()
+		return errors.New("box manager is closed")
+	}
 	cfgCopy := m.copyConfigLocked()
 	notStarted := m.currentBox == nil
 	runtimeCfg := cloneConfig(m.runtimeCfg)
@@ -1427,7 +1559,7 @@ func (m *Manager) triggerReloadLocked(ctx context.Context) error {
 		m.mu.Lock()
 		m.cfg = cfgCopy
 		m.mu.Unlock()
-		return m.Start(ctx)
+		return m.startLocked(ctx)
 	}
 	if canReconcileMultiPort(runtimeCfg, cfgCopy) {
 		if err := m.reconcileMultiPort(runtimeCfg, cfgCopy); err == nil {
@@ -1446,6 +1578,10 @@ func (m *Manager) ApplyRestoredConfig(ctx context.Context, restored *config.Conf
 		return errors.New("restored config is nil")
 	}
 	m.mu.RLock()
+	if m.closing {
+		m.mu.RUnlock()
+		return errors.New("box manager is closed")
+	}
 	running := m.currentBox != nil
 	baseCtx := m.baseCtx
 	m.mu.RUnlock()
@@ -1459,7 +1595,7 @@ func (m *Manager) ApplyRestoredConfig(ctx context.Context, restored *config.Conf
 		m.mu.Lock()
 		m.cfg = restored
 		m.mu.Unlock()
-		return m.Start(baseCtx)
+		return m.startLocked(baseCtx)
 	}
 
 	return m.enterEmptyRuntime(restored)
@@ -1554,13 +1690,20 @@ func (m *Manager) RebuildPortAssignments() error {
 
 // --- Helper functions ---
 
-// portBindErrorRegex matches "listen tcp4 0.0.0.0:24282: bind: address already in use"
-var portBindErrorRegex = regexp.MustCompile(`listen tcp[46]? [^:]+:(\d+): bind: address already in use`)
+var portBindErrorRegex = regexp.MustCompile(`listen tcp[46]? \S+:(\d+): bind: (?:address already in use|Only one usage of each socket address)`)
 
 // extractPortFromBindError extracts the port number from a bind error message.
 func extractPortFromBindError(err error) uint16 {
 	if err == nil {
 		return 0
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "listen" {
+		// Windows reports WSAEADDRINUSE rather than syscall.EADDRINUSE.
+		inUse := errors.Is(err, syscall.EADDRINUSE) || runtime.GOOS == "windows" && errors.Is(err, syscall.Errno(10048))
+		if addr, ok := opErr.Addr.(*net.TCPAddr); ok && inUse && addr.Port > 0 && addr.Port <= 65535 {
+			return uint16(addr.Port)
+		}
 	}
 	matches := portBindErrorRegex.FindStringSubmatch(err.Error())
 	if len(matches) < 2 {

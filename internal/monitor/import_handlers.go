@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -585,7 +586,11 @@ func (s *Server) handleImportAction(w http.ResponseWriter, r *http.Request) {
 		}
 		jobID, err := s.importSvc.StartRefreshSourcesWithPolicy(req.Key, req.Test204, req.SiteTargets)
 		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
+			if errors.Is(err, importer.ErrBatchTestBusy) {
+				w.WriteHeader(http.StatusConflict)
+			} else {
+				w.WriteHeader(http.StatusBadRequest)
+			}
 			writeJSON(w, map[string]string{"error": err.Error()})
 			return
 		}
@@ -888,7 +893,11 @@ func (s *Server) handleManagedNodesBatchTestStart(w http.ResponseWriter, r *http
 	}
 	jobID, err := s.importSvc.StartBatchTest(req)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		if errors.Is(err, importer.ErrBatchTestBusy) {
+			w.WriteHeader(http.StatusConflict)
+		} else {
+			w.WriteHeader(http.StatusBadRequest)
+		}
 		writeJSON(w, map[string]string{"error": err.Error()})
 		return
 	}

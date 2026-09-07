@@ -28,13 +28,22 @@ type PoolDialer interface {
 
 // Router handles HTTP proxy requests with path-based region routing
 type Router struct {
-	cfg        RouterConfig
-	pools      map[string]PoolDialer          // region -> dialer
-	global     PoolDialer                     // default pool for requests without region path
-	transports map[PoolDialer]*http.Transport // cached transports per dialer
-	server     *http.Server
-	mu         sync.RWMutex
-	logger     *log.Logger
+	cfg         RouterConfig
+	pools       map[string]PoolDialer          // region -> dialer
+	global      PoolDialer                     // default pool for requests without region path
+	transports  map[PoolDialer]*http.Transport // cached transports per dialer
+	server      *http.Server
+	listener    net.Listener
+	serveDone   chan struct{}
+	mu          sync.RWMutex
+	logger      *log.Logger
+	cancel      context.CancelFunc
+	stopOnce    sync.Once
+	stopDone    chan struct{}
+	stopErr     error
+	stopping    bool
+	connections map[net.Conn]struct{}
+	connWG      sync.WaitGroup
 }
 
 // NewRouter creates a new GeoIP router
@@ -43,10 +52,12 @@ func NewRouter(cfg RouterConfig, logger *log.Logger) *Router {
 		logger = log.Default()
 	}
 	return &Router{
-		cfg:        cfg,
-		pools:      make(map[string]PoolDialer),
-		transports: make(map[PoolDialer]*http.Transport),
-		logger:     logger,
+		cfg:         cfg,
+		pools:       make(map[string]PoolDialer),
+		transports:  make(map[PoolDialer]*http.Transport),
+		logger:      logger,
+		stopDone:    make(chan struct{}),
+		connections: make(map[net.Conn]struct{}),
 	}
 }
 
@@ -68,24 +79,49 @@ func (r *Router) SetGlobalPool(dialer PoolDialer) {
 
 // Start starts the GeoIP router HTTP server
 func (r *Router) Start(ctx context.Context) error {
-	addr := fmt.Sprintf("%s:%d", r.cfg.Listen, r.cfg.Port)
-
-	r.server = &http.Server{
-		Addr:    addr,
-		Handler: r,
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	addr := fmt.Sprintf("%s:%d", r.cfg.Listen, r.cfg.Port)
+	lifecycleCtx, cancel := context.WithCancel(ctx)
+
+	r.mu.Lock()
+	if r.stopping || r.server != nil {
+		r.mu.Unlock()
+		cancel()
+		return fmt.Errorf("geoip router is already stopped or started")
+	}
+	r.server = &http.Server{
+		Addr:        addr,
+		Handler:     r,
+		BaseContext: func(net.Listener) context.Context { return lifecycleCtx },
+	}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		r.server = nil
+		r.mu.Unlock()
+		cancel()
+		return err
+	}
+	r.cancel = cancel
+	r.listener = listener
+	r.serveDone = make(chan struct{})
+	serveDone := r.serveDone
+	srv := r.server
+	r.mu.Unlock()
 
 	go func() {
+		defer close(serveDone)
 		r.logger.Printf("🌐 GeoIP Router started on %s", addr)
 		r.logger.Println("   Routes: /jp, /kr, /us, /hk, /tw, /sg, /other (default: all nodes)")
-		if err := r.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
 			r.logger.Printf("GeoIP router error: %v", err)
 		}
 	}()
 
 	go func() {
-		<-ctx.Done()
-		r.Stop()
+		<-lifecycleCtx.Done()
+		_ = r.Stop()
 	}()
 
 	return nil
@@ -93,15 +129,59 @@ func (r *Router) Start(ctx context.Context) error {
 
 // Stop stops the GeoIP router
 func (r *Router) Stop() error {
+	r.stopOnce.Do(func() {
+		r.mu.Lock()
+		r.stopping = true
+		cancel := r.cancel
+		srv := r.server
+		listener, serveDone := r.listener, r.serveDone
+		r.closeTransportsLocked()
+		connections := make([]net.Conn, 0, len(r.connections))
+		for conn := range r.connections {
+			connections = append(connections, conn)
+		}
+		r.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+		if srv != nil {
+			ctx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+			r.stopErr = srv.Shutdown(ctx)
+			cancelShutdown()
+			if r.stopErr != nil {
+				_ = srv.Close()
+			}
+		}
+		if listener != nil {
+			_ = listener.Close()
+			<-serveDone
+		}
+		r.connWG.Wait()
+		close(r.stopDone)
+	})
+	<-r.stopDone
+	return r.stopErr
+}
+
+func (r *Router) registerConnection(conn net.Conn) bool {
 	r.mu.Lock()
-	r.closeTransportsLocked()
-	r.mu.Unlock()
-	if r.server != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return r.server.Shutdown(ctx)
+	defer r.mu.Unlock()
+	if r.stopping {
+		return false
 	}
-	return nil
+	r.connections[conn] = struct{}{}
+	r.connWG.Add(1)
+	return true
+}
+
+func (r *Router) unregisterConnection(conn net.Conn) {
+	r.mu.Lock()
+	delete(r.connections, conn)
+	r.mu.Unlock()
+	r.connWG.Done()
 }
 
 func (r *Router) closeTransportsLocked() {
@@ -225,12 +305,21 @@ func (r *Router) handleConnect(w http.ResponseWriter, req *http.Request, dialer 
 		return
 	}
 
-	clientConn, _, err := hijacker.Hijack()
+	clientConn, buffered, err := hijacker.Hijack()
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Hijack failed: %v", err), http.StatusInternalServerError)
 		return
 	}
+	if !r.registerConnection(clientConn) {
+		_ = clientConn.Close()
+		return
+	}
+	defer r.unregisterConnection(clientConn)
 	defer clientConn.Close()
+	if !r.registerConnection(targetConn) {
+		return
+	}
+	defer r.unregisterConnection(targetConn)
 
 	// Send 200 Connection Established
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
@@ -241,12 +330,16 @@ func (r *Router) handleConnect(w http.ResponseWriter, req *http.Request, dialer 
 
 	go func() {
 		defer wg.Done()
-		io.Copy(targetConn, clientConn)
+		defer targetConn.Close()
+		defer clientConn.Close()
+		_, _ = io.Copy(targetConn, buffered)
 	}()
 
 	go func() {
 		defer wg.Done()
-		io.Copy(clientConn, targetConn)
+		defer targetConn.Close()
+		defer clientConn.Close()
+		_, _ = io.Copy(clientConn, targetConn)
 	}()
 
 	wg.Wait()
@@ -271,6 +364,7 @@ func (r *Router) getTransport(dialer PoolDialer) *http.Transport {
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 10,
 		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives:   r.stopping,
 	}
 	r.transports[dialer] = t
 	return t

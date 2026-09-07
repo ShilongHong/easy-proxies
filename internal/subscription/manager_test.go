@@ -95,7 +95,7 @@ func TestManagerDelegatesRefreshToManagedSources(t *testing.T) {
 	}}
 	manager.SetSourceRefresher(refresher)
 
-	manager.doRefresh()
+	manager.doRefresh(context.Background())
 
 	status := manager.Status()
 	if refresher.starts.Load() != 1 {
@@ -116,7 +116,7 @@ func TestManagerReportsManagedRefreshFailure(t *testing.T) {
 	}}
 	manager.SetSourceRefresher(refresher)
 
-	manager.doRefresh()
+	manager.doRefresh(context.Background())
 
 	status := manager.Status()
 	if status.LastError == "" {
@@ -133,7 +133,7 @@ func TestManagerPassesConfiguredVerificationPolicy(t *testing.T) {
 	refresher := &fakeSourceRefresher{job: importer.SourceRefreshJob{ID: "refresh-job", Status: importer.SourceRefreshJobFinished}}
 	manager.SetSourceRefresher(refresher)
 
-	manager.doRefresh()
+	manager.doRefresh(context.Background())
 
 	refresher.mu.Lock()
 	defer refresher.mu.Unlock()

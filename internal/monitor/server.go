@@ -94,7 +94,15 @@ type Server struct {
 	sessionTTL time.Duration
 
 	// Concurrency control
-	probeSem *semaphore.Weighted
+	probeSem   *semaphore.Weighted
+	probeAllMu sync.Mutex
+
+	lifecycleCancel context.CancelFunc
+	cleanupDone     chan struct{}
+	shutdownMu      sync.Mutex
+	shutdownStarted bool
+	shutdownDone    chan struct{}
+	shutdownErr     error
 
 	subRefresher SubscriptionRefresher
 	nodeMgr      NodeManager
@@ -117,17 +125,21 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 		maxConcurrentProbes = 10
 	}
 
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	s := &Server{
-		cfg:        cfg,
-		mgr:        mgr,
-		logger:     logger,
-		sessions:   make(map[string]*Session),
-		sessionTTL: 24 * time.Hour,
-		probeSem:   semaphore.NewWeighted(maxConcurrentProbes),
+		cfg:             cfg,
+		mgr:             mgr,
+		logger:          logger,
+		sessions:        make(map[string]*Session),
+		sessionTTL:      24 * time.Hour,
+		probeSem:        semaphore.NewWeighted(maxConcurrentProbes),
+		lifecycleCancel: lifecycleCancel,
+		cleanupDone:     make(chan struct{}),
+		shutdownDone:    make(chan struct{}),
 	}
 
 	// Start session cleanup goroutine
-	go s.cleanupExpiredSessions()
+	go s.cleanupExpiredSessions(lifecycleCtx)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
@@ -197,7 +209,10 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 			logger.Printf("pprof disabled: management listen address is not loopback")
 		}
 	}
-	s.srv = &http.Server{Addr: cfg.Listen, Handler: mux}
+	s.srv = &http.Server{
+		Addr: cfg.Listen, Handler: mux,
+		BaseContext: func(net.Listener) context.Context { return lifecycleCtx },
+	}
 	return s
 }
 
@@ -341,6 +356,9 @@ func (s *Server) Start(ctx context.Context) {
 	if s == nil || s.srv == nil {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.logger.Printf("Starting monitor server on %s", s.cfg.Listen)
 	go func() {
 		if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -352,17 +370,79 @@ func (s *Server) Start(ctx context.Context) {
 	s.logger.Printf("✅ Monitor server started on http://%s", s.cfg.Listen)
 
 	go func() {
-		<-ctx.Done()
-		s.Shutdown(context.Background())
+		select {
+		case <-ctx.Done():
+		case <-s.cleanupDone:
+			return
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = s.Shutdown(shutdownCtx)
 	}()
 }
 
 // Shutdown stops the server gracefully.
-func (s *Server) Shutdown(ctx context.Context) {
+func (s *Server) Shutdown(ctx context.Context) error {
 	if s == nil || s.srv == nil {
-		return
+		return nil
 	}
-	_ = s.srv.Shutdown(ctx)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	s.shutdownMu.Lock()
+	if s.shutdownDone == nil {
+		s.shutdownDone = make(chan struct{})
+	}
+	if s.cleanupDone == nil {
+		s.cleanupDone = make(chan struct{})
+		close(s.cleanupDone)
+	}
+	if s.shutdownStarted {
+		done := s.shutdownDone
+		s.shutdownMu.Unlock()
+		select {
+		case <-done:
+			s.shutdownMu.Lock()
+			err := s.shutdownErr
+			s.shutdownMu.Unlock()
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	s.shutdownStarted = true
+	done := s.shutdownDone
+	s.shutdownMu.Unlock()
+
+	if s.lifecycleCancel != nil {
+		s.lifecycleCancel()
+	}
+	err := s.srv.Shutdown(ctx)
+	if err != nil {
+		// Shutdown does not interrupt active handlers. Force-close the
+		// server once the caller's bounded grace period expires.
+		_ = s.srv.Close()
+	}
+	<-s.cleanupDone
+	s.shutdownMu.Lock()
+	s.shutdownErr = err
+	close(done)
+	s.shutdownMu.Unlock()
+	return err
+}
+
+// Close immediately closes listeners and active HTTP connections.
+func (s *Server) Close() error {
+	if s == nil || s.srv == nil {
+		return nil
+	}
+	if s.lifecycleCancel != nil {
+		s.lifecycleCancel()
+	}
+	return s.srv.Close()
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -544,6 +624,11 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.probeAllMu.TryLock() {
+		http.Error(w, "batch probe already in progress", http.StatusConflict)
+		return
+	}
+	defer s.probeAllMu.Unlock()
 
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -583,49 +668,49 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 		err     string
 	}
 	results := make(chan probeResult, total)
-	var wg sync.WaitGroup
-
-	// Launch probes with semaphore control
-	for _, snap := range snapshots {
-		wg.Add(1)
-		go func(snap Snapshot) {
-			defer wg.Done()
-
-			// Acquire semaphore permit
-			if err := s.probeSem.Acquire(ctx, 1); err != nil {
-				results <- probeResult{
-					tag:  snap.Tag,
-					name: snap.Name,
-					err:  "probe cancelled: " + err.Error(),
-				}
-				return
-			}
-			defer s.probeSem.Release(1)
-
-			// Execute probe
-			probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
-			defer probeCancel()
-
-			latency, err := s.mgr.Probe(probeCtx, snap.Tag)
-			if err != nil {
-				results <- probeResult{
-					tag:     snap.Tag,
-					name:    snap.Name,
-					latency: -1,
-					err:     err.Error(),
-				}
-			} else {
-				results <- probeResult{
-					tag:     snap.Tag,
-					name:    snap.Name,
-					latency: latency.Milliseconds(),
-					err:     "",
-				}
-			}
-		}(snap)
+	jobs := make(chan Snapshot, total)
+	workerCount := int(runtime.NumCPU() * 4)
+	if workerCount < 10 {
+		workerCount = 10
 	}
-
-	// Wait for all probes to complete
+	if workerCount > 32 {
+		workerCount = 32
+	}
+	if workerCount > total {
+		workerCount = total
+	}
+	var wg sync.WaitGroup
+	probe := func(snap Snapshot) {
+		if err := s.probeSem.Acquire(ctx, 1); err != nil {
+			results <- probeResult{tag: snap.Tag, name: snap.Name, err: "probe cancelled: " + err.Error()}
+			return
+		}
+		defer s.probeSem.Release(1)
+		probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer probeCancel()
+		latency, err := s.mgr.Probe(probeCtx, snap.Tag)
+		if err != nil {
+			results <- probeResult{tag: snap.Tag, name: snap.Name, latency: -1, err: err.Error()}
+			return
+		}
+		results <- probeResult{tag: snap.Tag, name: snap.Name, latency: latency.Milliseconds()}
+	}
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for snap := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				probe(snap)
+			}
+		}()
+	}
+	for _, snap := range snapshots {
+		jobs <- snap
+	}
+	close(jobs)
 	go func() {
 		wg.Wait()
 		close(results)
@@ -1664,11 +1749,17 @@ func (s *Server) validateSession(token string) bool {
 }
 
 // cleanupExpiredSessions periodically removes expired sessions.
-func (s *Server) cleanupExpiredSessions() {
+func (s *Server) cleanupExpiredSessions(ctx context.Context) {
+	defer close(s.cleanupDone)
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 
-	for range ticker.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 		now := time.Now()
 		s.sessionMu.Lock()
 		for token, session := range s.sessions {

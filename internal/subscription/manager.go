@@ -40,7 +40,10 @@ func WithLogger(l Logger) Option {
 
 // Manager handles periodic subscription refresh.
 type Manager struct {
-	mu sync.RWMutex
+	mu          sync.RWMutex
+	lifecycleMu sync.Mutex
+	loopDone    chan struct{}
+	stopped     bool
 
 	baseCfg *config.Config
 	boxMgr  *boxmgr.Manager
@@ -93,6 +96,13 @@ func New(cfg *config.Config, boxMgr *boxmgr.Manager, opts ...Option) *Manager {
 
 // Start begins the periodic refresh loop.
 func (m *Manager) Start() {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopped || m.loopDone != nil {
+		return
+	}
 	if !m.baseCfg.SubscriptionRefresh.Enabled {
 		m.logger.Infof("subscription refresh disabled")
 		return
@@ -105,15 +115,44 @@ func (m *Manager) Start() {
 	interval := m.baseCfg.SubscriptionRefresh.Interval
 	m.logger.Infof("starting subscription refresh, interval: %s", interval)
 
-	go m.refreshLoop(interval)
+	m.startLoopLocked()
 }
 
 // Stop stops the periodic refresh.
 func (m *Manager) Stop() {
-	if m.cancel != nil {
-		m.cancel()
-	}
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.mu.Lock()
+	m.stopped = true
+	m.mu.Unlock()
+	m.stopLoopLocked()
+}
 
+func (m *Manager) startLoopLocked() {
+	ctx, manual := m.ctx, m.manualRefresh
+	interval := m.baseCfg.SubscriptionRefresh.Interval
+	enabled := m.baseCfg.SubscriptionRefresh.Enabled
+	done := make(chan struct{})
+	m.loopDone = done
+	go func() {
+		defer close(done)
+		m.refreshLoop(ctx, manual, interval, enabled)
+	}()
+}
+
+func (m *Manager) stopLoopLocked() {
+	m.mu.RLock()
+	cancel, done := m.cancel, m.loopDone
+	m.mu.RUnlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+	m.mu.Lock()
+	m.loopDone = nil
+	m.mu.Unlock()
 }
 
 func (m *Manager) SetSourceRefresher(refresher SourceRefresher) {
@@ -124,70 +163,79 @@ func (m *Manager) SetSourceRefresher(refresher SourceRefresher) {
 
 // UpdateConfig hot-reloads subscription URLs and refresh settings without restart.
 func (m *Manager) UpdateConfig(urls []string, enabled bool, interval time.Duration) {
+	m.updateConfig(urls, enabled, interval)
+}
+
+func (m *Manager) updateConfig(urls []string, enabled bool, interval time.Duration) (context.Context, int) {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.mu.RLock()
+	stopped := m.stopped
+	baseCtx, startCount := m.ctx, m.status.RefreshCount
+	m.mu.RUnlock()
+	if stopped {
+		return baseCtx, startCount
+	}
+	m.stopLoopLocked()
 	m.mu.Lock()
-	m.baseCfg.Subscriptions = urls
+	m.baseCfg.Subscriptions = append([]string(nil), urls...)
 	m.baseCfg.SubscriptionRefresh.Enabled = enabled
 	if interval > 0 {
 		m.baseCfg.SubscriptionRefresh.Interval = interval
 	}
+	m.ctx, m.cancel = context.WithCancel(context.Background())
+	m.manualRefresh = make(chan struct{}, 1)
+	baseCtx, startCount = m.ctx, m.status.RefreshCount
+	cfg := m.baseCfg
+	interval = cfg.SubscriptionRefresh.Interval
+	manual := m.manualRefresh
 	m.mu.Unlock()
 
-	// Persist to config.yaml
-	if err := m.baseCfg.SaveSettings(); err != nil {
+	if err := cfg.SaveSettings(); err != nil {
 		m.logger.Errorf("failed to save subscription config: %v", err)
 	}
-
-	// Restart the refresh loop with new settings
-	if m.cancel != nil {
-		m.cancel()
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	m.mu.Lock()
-	m.ctx = ctx
-	m.cancel = cancel
-	m.manualRefresh = make(chan struct{}, 1)
-	m.mu.Unlock()
-
 	if len(urls) == 0 {
 		m.logger.Infof("no subscription URLs configured, skipping refresh")
-		return
+		return baseCtx, startCount
 	}
 
 	// Always start the refresh loop to handle the immediate refresh signal
-	m.logger.Infof("subscription config updated: %d URLs, enabled=%v, interval=%s", len(urls), enabled, m.baseCfg.SubscriptionRefresh.Interval)
-	go m.refreshLoop(m.baseCfg.SubscriptionRefresh.Interval)
+	m.logger.Infof("subscription config updated: %d URLs, enabled=%v, interval=%s", len(urls), enabled, interval)
+	m.mu.Lock()
+	m.startLoopLocked()
+	m.mu.Unlock()
 
 	// Always trigger an immediate fetch when URLs are provided,
 	// regardless of the "enabled" flag (which only controls periodic auto-refresh)
 	select {
-	case m.manualRefresh <- struct{}{}:
+	case manual <- struct{}{}:
 		m.logger.Infof("triggered immediate refresh after config update")
 	default:
 		// A refresh is already pending
 	}
+	return baseCtx, startCount
 }
 
 func (m *Manager) ApplyRestoredConfig(restored *config.Config) {
 	if restored == nil {
 		return
 	}
-	m.mu.Lock()
-	previousCancel := m.cancel
-	m.baseCfg = restored
-	m.mu.Unlock()
-	if previousCancel != nil {
-		previousCancel()
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.mu.RLock()
+	stopped := m.stopped
+	m.mu.RUnlock()
+	if stopped {
+		return
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	m.stopLoopLocked()
 	m.mu.Lock()
-	m.ctx = ctx
-	m.cancel = cancel
+	defer m.mu.Unlock()
+	m.baseCfg = restored
+	m.ctx, m.cancel = context.WithCancel(context.Background())
 	m.manualRefresh = make(chan struct{}, 1)
-	interval := restored.SubscriptionRefresh.Interval
-	urls := len(restored.Subscriptions)
-	m.mu.Unlock()
-	if urls > 0 {
-		go m.refreshLoop(interval)
+	if len(restored.Subscriptions) > 0 {
+		m.startLoopLocked()
 	}
 }
 
@@ -195,26 +243,28 @@ func (m *Manager) ApplyRestoredConfig(restored *config.Config) {
 // the first refresh to complete before returning. This ensures the caller (WebUI API)
 // can confirm the update took effect.
 func (m *Manager) UpdateConfigAndRefresh(urls []string, enabled bool, interval time.Duration) error {
-	m.UpdateConfig(urls, enabled, interval)
+	baseCtx, startCount := m.updateConfig(urls, enabled, interval)
 
 	if len(urls) == 0 {
 		return nil
 	}
 
 	// Wait for the refresh triggered by UpdateConfig to complete
+	m.mu.RLock()
 	timeout := m.baseCfg.SubscriptionRefresh.Timeout
+	healthTimeout := m.baseCfg.SubscriptionRefresh.HealthCheckTimeout
+	m.mu.RUnlock()
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	deadline := timeout + m.baseCfg.SubscriptionRefresh.HealthCheckTimeout
+	deadline := timeout + healthTimeout
 
-	ctx, cancel := context.WithTimeout(m.ctx, deadline)
+	ctx, cancel := context.WithTimeout(baseCtx, deadline)
 	defer cancel()
 
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
-	startCount := m.Status().RefreshCount
 	for {
 		select {
 		case <-ctx.Done():
@@ -233,26 +283,32 @@ func (m *Manager) UpdateConfigAndRefresh(urls []string, enabled bool, interval t
 
 // RefreshNow triggers an immediate refresh.
 func (m *Manager) RefreshNow() error {
+	m.mu.RLock()
+	baseCtx, manual := m.ctx, m.manualRefresh
+	timeout := m.baseCfg.SubscriptionRefresh.Timeout
+	healthTimeout := m.baseCfg.SubscriptionRefresh.HealthCheckTimeout
+	startCount := m.status.RefreshCount
+	m.mu.RUnlock()
 	select {
-	case m.manualRefresh <- struct{}{}:
+	case <-baseCtx.Done():
+		return baseCtx.Err()
+	case manual <- struct{}{}:
 	default:
 		// Already a refresh pending
 	}
 
 	// Wait for refresh to complete or timeout
-	timeout := m.baseCfg.SubscriptionRefresh.Timeout
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
 
-	ctx, cancel := context.WithTimeout(m.ctx, timeout+m.baseCfg.SubscriptionRefresh.HealthCheckTimeout)
+	ctx, cancel := context.WithTimeout(baseCtx, timeout+healthTimeout)
 	defer cancel()
 
 	// Poll status until refresh completes
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
-	startCount := m.Status().RefreshCount
 	for {
 		select {
 		case <-ctx.Done():
@@ -281,15 +337,13 @@ func (m *Manager) Status() monitor.SubscriptionStatus {
 }
 
 // refreshLoop runs the periodic refresh.
-func (m *Manager) refreshLoop(interval time.Duration) {
-	m.mu.RLock()
-	autoEnabled := m.baseCfg.SubscriptionRefresh.Enabled
-	m.mu.RUnlock()
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	if autoEnabled {
+func (m *Manager) refreshLoop(ctx context.Context, manual <-chan struct{}, interval time.Duration, autoEnabled bool) {
+	var ticker *time.Ticker
+	var ticks <-chan time.Time
+	if autoEnabled && interval > 0 {
+		ticker = time.NewTicker(interval)
+		ticks = ticker.C
+		defer ticker.Stop()
 		// Update next refresh time only when auto-refresh is enabled
 		m.mu.Lock()
 		m.status.NextRefresh = time.Now().Add(interval)
@@ -298,21 +352,17 @@ func (m *Manager) refreshLoop(interval time.Duration) {
 
 	for {
 		select {
-		case <-m.ctx.Done():
+		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			// Only do periodic refresh when auto-refresh is enabled
-			if !autoEnabled {
-				continue
-			}
-			m.doRefresh()
+		case <-ticks:
+			m.doRefresh(ctx)
 			m.mu.Lock()
 			m.status.NextRefresh = time.Now().Add(interval)
 			m.mu.Unlock()
-		case <-m.manualRefresh:
+		case <-manual:
 			// Always honor manual/immediate refresh regardless of enabled flag
-			m.doRefresh()
-			if autoEnabled {
+			m.doRefresh(ctx)
+			if ticker != nil {
 				ticker.Reset(interval)
 				m.mu.Lock()
 				m.status.NextRefresh = time.Now().Add(interval)
@@ -323,7 +373,10 @@ func (m *Manager) refreshLoop(interval time.Duration) {
 }
 
 // doRefresh performs a single refresh operation.
-func (m *Manager) doRefresh() {
+func (m *Manager) doRefresh(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
 	// Prevent concurrent refreshes
 	if !m.refreshMu.TryLock() {
 		m.logger.Warnf("refresh already in progress, skipping")
@@ -343,7 +396,7 @@ func (m *Manager) doRefresh() {
 	}()
 
 	m.logger.Infof("starting subscription refresh")
-	if handled, err := m.refreshManagedSources(); handled {
+	if handled, err := m.refreshManagedSources(ctx); handled {
 		m.mu.Lock()
 		m.status.LastRefresh = time.Now()
 		m.status.LastError = ""
@@ -360,7 +413,10 @@ func (m *Manager) doRefresh() {
 	}
 
 	// Fetch nodes from all subscriptions
-	nodes, err := m.fetchAllSubscriptions()
+	nodes, err := m.fetchAllSubscriptions(ctx)
+	if ctx.Err() != nil {
+		return
+	}
 	if err != nil {
 		m.logger.Errorf("fetch subscriptions failed: %v", err)
 		m.mu.Lock()
@@ -417,10 +473,9 @@ func (m *Manager) doRefresh() {
 	m.logger.Infof("subscription refresh completed, %d candidate nodes written to nodes.txt", len(nodes))
 }
 
-func (m *Manager) refreshManagedSources() (bool, error) {
+func (m *Manager) refreshManagedSources(ctx context.Context) (bool, error) {
 	m.mu.RLock()
 	refresher := m.sourceRefresher
-	ctx := m.ctx
 	test204Enabled := m.baseCfg.SubscriptionRefresh.Test204Enabled()
 	siteTargets := append([]string(nil), m.baseCfg.SubscriptionRefresh.SiteTargets...)
 	m.mu.RUnlock()
@@ -433,9 +488,6 @@ func (m *Manager) refreshManagedSources() (bool, error) {
 	}
 	if err != nil {
 		return true, err
-	}
-	if ctx == nil {
-		ctx = context.Background()
 	}
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
@@ -473,6 +525,8 @@ func (m *Manager) refreshManagedSources() (bool, error) {
 
 // getNodesFilePath returns the path to nodes.txt.
 func (m *Manager) getNodesFilePath() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if m.baseCfg.NodesFile != "" {
 		return m.baseCfg.NodesFile
 	}
@@ -565,9 +619,8 @@ func (m *Manager) MarkNodesModified() {
 }
 
 // fetchAllSubscriptions fetches nodes from all configured subscription URLs.
-func (m *Manager) fetchAllSubscriptions() ([]config.NodeConfig, error) {
+func (m *Manager) fetchAllSubscriptions(ctx context.Context) ([]config.NodeConfig, error) {
 	m.mu.RLock()
-	ctx := m.ctx
 	urls := append([]string(nil), m.baseCfg.Subscriptions...)
 	timeout := m.baseCfg.SubscriptionRefresh.Timeout
 	skipTLSVerify := m.baseCfg.SkipCertVerify

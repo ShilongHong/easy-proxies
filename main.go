@@ -20,8 +20,23 @@ import (
 
 func main() {
 	var configPath string
+	var shutdownOnStdinClose bool
 	flag.StringVar(&configPath, "config", "config.yaml", "path to config file")
+	flag.BoolVar(&shutdownOnStdinClose, "shutdown-on-stdin-close", false, "exit when the owning launcher's stdin pipe closes")
 	flag.Parse()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if shutdownOnStdinClose {
+		go func() {
+			_, _ = io.Copy(io.Discard, os.Stdin)
+			cancel()
+			// The owner must not leave listeners behind even if a dependency
+			// fails to honor cancellation during startup or shutdown.
+			time.Sleep(35 * time.Second)
+			os.Exit(1)
+		}()
+	}
 
 	var cfg *config.Config
 	for attempt := 1; attempt <= 3; attempt++ {
@@ -40,9 +55,6 @@ func main() {
 
 	// Setup logging based on config
 	setupLogging(cfg)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	if err := app.Run(ctx, cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "proxy pool exited with error: %v\n", err)

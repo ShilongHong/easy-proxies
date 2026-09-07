@@ -23,6 +23,7 @@ import (
 )
 
 var ErrNoRefreshSources = errors.New("no refreshable import sources")
+var ErrBatchTestBusy = errors.New("batch test already in progress")
 
 const (
 	FetchDirect    = "direct"
@@ -89,6 +90,7 @@ type Service struct {
 	importCancels         map[string]context.CancelFunc
 	testJobsMu            sync.RWMutex
 	testJobs              map[string]*TestJob
+	testStartMu           sync.Mutex
 	testCancelsMu         sync.Mutex
 	testCancels           map[string]context.CancelFunc
 	refreshJobsMu         sync.RWMutex
@@ -258,6 +260,7 @@ func (s *Service) launchBackground(register func(context.CancelFunc), run func(c
 	s.lifecycleMu.Unlock()
 	go func() {
 		defer s.jobsWG.Done()
+		defer cancel()
 		run(ctx)
 	}()
 	return true
@@ -403,8 +406,13 @@ func (s *Service) StartRefreshSourcesWithPolicy(key string, test204 *bool, siteT
 	}
 	s.refreshStartMu.Lock()
 	defer s.refreshStartMu.Unlock()
+	s.testStartMu.Lock()
+	defer s.testStartMu.Unlock()
 	if jobID := s.activeRefreshJobID(); jobID != "" {
 		return jobID, nil
+	}
+	if s.hasRunningTestJob() {
+		return "", ErrBatchTestBusy
 	}
 	targets, err := s.sourceRefreshTargets(key)
 	if err != nil {
@@ -3058,6 +3066,12 @@ func (s *Service) StartBatchTest(req BatchTestRequest) (string, error) {
 		}
 		req.Test204, req.SiteTargets = VerificationPolicyPointers(policy)
 	}
+	// Source refresh owns its child tests; other batches cannot overlap it.
+	s.testStartMu.Lock()
+	defer s.testStartMu.Unlock()
+	if !req.ParentRefresh && (s.hasRunningTestJob() || s.activeRefreshJobID() != "") {
+		return "", ErrBatchTestBusy
+	}
 	jobID := randomHex(12)
 	now := time.Now()
 	job := &TestJob{
@@ -3079,10 +3093,10 @@ func (s *Service) StartBatchTest(req BatchTestRequest) (string, error) {
 	}
 	s.testJobsMu.Unlock()
 	copyJob := *job
-	s.publishJobEvent(JobEvent{Kind: "test", ID: jobID, Test: &copyJob})
 
 	started := s.launchBackground(func(cancel context.CancelFunc) {
 		s.registerTestCancel(jobID, cancel)
+		s.publishJobEvent(JobEvent{Kind: "test", ID: jobID, Test: &copyJob})
 	}, func(ctx context.Context) {
 		s.runBatchTestJob(ctx, jobID, req)
 	})
@@ -3095,6 +3109,17 @@ func (s *Service) StartBatchTest(req BatchTestRequest) (string, error) {
 		return "", fmt.Errorf("服务正在关闭")
 	}
 	return jobID, nil
+}
+
+func (s *Service) hasRunningTestJob() bool {
+	s.testJobsMu.RLock()
+	defer s.testJobsMu.RUnlock()
+	for _, job := range s.testJobs {
+		if job != nil && job.Status == TestJobRunning {
+			return true
+		}
+	}
+	return false
 }
 
 // GetTestJob returns a snapshot copy of the job by id.
@@ -3167,7 +3192,11 @@ func (s *Service) runBatchTestJob(ctx context.Context, jobID string, req BatchTe
 	defer s.unregisterTestCancel(jobID)
 	var snapshot sourceRefreshSnapshot
 	hasSnapshot := false
+	applyLocked := false
 	defer func() {
+		if applyLocked {
+			defer s.applyMu.Unlock()
+		}
 		if r := recover(); r != nil {
 			message := fmt.Sprintf("测试任务异常: %v", r)
 			if hasSnapshot {
@@ -3196,20 +3225,6 @@ func (s *Service) runBatchTestJob(ctx context.Context, jobID string, req BatchTe
 		})
 		return
 	}
-	if !req.ParentRefresh {
-		var err error
-		snapshot, err = s.captureSourceRefreshSnapshot()
-		if err != nil {
-			s.updateJob(jobID, func(j *TestJob) {
-				j.Status = TestJobFailed
-				j.Phase = "failed"
-				j.Error = "创建测试回滚点失败: " + err.Error()
-			})
-			return
-		}
-		hasSnapshot = true
-	}
-
 	changed := false
 	needReload := false
 	finish := func(status TestJobStatus, phase, errText string) {
@@ -3251,6 +3266,26 @@ func (s *Service) runBatchTestJob(ctx context.Context, jobID string, req BatchTe
 				j.ProtectionReason = errText
 			}
 		})
+	}
+	beginApply := func() bool {
+		if !applyLocked {
+			s.applyMu.Lock()
+			applyLocked = true
+		}
+		if ctx.Err() != nil {
+			finish(TestJobCanceled, "canceled", "已终止")
+			return false
+		}
+		if !req.ParentRefresh && !hasSnapshot {
+			var err error
+			snapshot, err = s.captureSourceRefreshSnapshot()
+			if err != nil {
+				finish(TestJobFailed, "failed", "创建测试回滚点失败: "+err.Error())
+				return false
+			}
+			hasSnapshot = true
+		}
+		return true
 	}
 
 	// --- Phase: probe ---
@@ -3328,6 +3363,9 @@ func (s *Service) runBatchTestJob(ctx context.Context, jobID string, req BatchTe
 				job.SiteProgress = append([]SiteTestProgress(nil), progress...)
 			})
 		})
+		if !beginApply() {
+			return
+		}
 		for _, original := range probeNodes {
 			result, exists := results[original.ID]
 			if !exists {
@@ -3357,8 +3395,6 @@ func (s *Service) runBatchTestJob(ctx context.Context, jobID string, req BatchTe
 			return
 		}
 		changed = changed || len(updates) > 0
-		s.applyMu.Lock()
-		defer s.applyMu.Unlock()
 		if len(poolNamesToDelete) > 0 {
 			if err := s.deleteConfigNodesStrict(poolNamesToDelete); err != nil {
 				finish(TestJobFinished, "protected", "移除失效节点配置失败，已保留检测前节点池: "+err.Error())
@@ -3432,6 +3468,9 @@ func (s *Service) runBatchTestJob(ctx context.Context, jobID string, req BatchTe
 			changed = true
 			s.updateJob(jobID, func(j *TestJob) { j.Done++; j.CountryOK++ })
 		}
+		if !beginApply() {
+			return
+		}
 		if len(configUpdates) > 0 {
 			if normalized, err := s.updateConfigNodes(configUpdates); err == nil {
 				for i := range updates {
@@ -3458,6 +3497,9 @@ func (s *Service) runBatchTestJob(ctx context.Context, jobID string, req BatchTe
 
 	// --- Phase: promote ---
 	if req.PromotePassed {
+		if !beginApply() {
+			return
+		}
 		s.updateJob(jobID, func(j *TestJob) { j.Phase = "promote" })
 		promoted, err := s.PromoteMany(req.NodeIDs, false)
 		if err != nil {

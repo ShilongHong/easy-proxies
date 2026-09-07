@@ -108,6 +108,8 @@ type Manager struct {
 	cancel       context.CancelFunc
 	healthMu     sync.Mutex
 	healthCancel context.CancelFunc
+	healthWG     sync.WaitGroup
+	stopped      bool
 	probeRunning atomic.Bool
 	logger       Logger
 }
@@ -163,6 +165,9 @@ func (m *Manager) SetLogger(logger Logger) {
 // interval: how often to check (e.g., 30 * time.Second)
 // timeout: timeout for each probe (e.g., 10 * time.Second)
 func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) bool {
+	if interval <= 0 {
+		return false
+	}
 	if !m.probeReady {
 		if m.logger != nil {
 			m.logger.Warn("probe target not configured, periodic health check disabled")
@@ -170,15 +175,17 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) bool
 		return false
 	}
 	m.healthMu.Lock()
-	if m.healthCancel != nil {
+	if m.stopped || m.healthCancel != nil {
 		m.healthMu.Unlock()
 		return false
 	}
 	healthCtx, cancel := context.WithCancel(m.ctx)
 	m.healthCancel = cancel
+	m.healthWG.Add(1)
 	m.healthMu.Unlock()
 
 	go func() {
+		defer m.healthWG.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		initial := time.NewTimer(15 * time.Second)
@@ -219,6 +226,14 @@ func (m *Manager) ProbeAllNow(timeout time.Duration) {
 
 // probeAllNodes checks all registered nodes concurrently.
 func (m *Manager) probeAllNodes(ctx context.Context, timeout time.Duration) {
+	m.healthMu.Lock()
+	if m.stopped || ctx.Err() != nil {
+		m.healthMu.Unlock()
+		return
+	}
+	m.healthWG.Add(1)
+	m.healthMu.Unlock()
+	defer m.healthWG.Done()
 	if !m.probeRunning.CompareAndSwap(false, true) {
 		return
 	}
@@ -302,10 +317,17 @@ func (m *Manager) probeAllNodes(ctx context.Context, timeout time.Duration) {
 
 // Stop stops the periodic health check.
 func (m *Manager) Stop() {
-	m.StopPeriodicHealthCheck()
+	m.healthMu.Lock()
+	m.stopped = true
+	if m.healthCancel != nil {
+		m.healthCancel()
+		m.healthCancel = nil
+	}
 	if m.cancel != nil {
 		m.cancel()
 	}
+	m.healthMu.Unlock()
+	m.healthWG.Wait()
 }
 
 func parsePort(value string) uint16 {

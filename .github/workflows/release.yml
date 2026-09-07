@@ -49,6 +49,11 @@ jobs:
       - name: Run vet
         run: go vet ./...
 
+      - name: Run race and runtime tests with release features
+        env:
+          EASY_PROXIES_RUNTIME_TEST: "1"
+        run: go test -race -tags "$BUILD_TAGS" ./...
+
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
     needs: test

@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
@@ -20,6 +19,8 @@ import (
 
 // Run builds the runtime components from config and blocks until shutdown.
 func Run(ctx context.Context, cfg *config.Config) error {
+	ctx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
 	startupStarted := time.Now()
 	// Build monitor config
 	proxyUsername := cfg.Listener.Username
@@ -42,6 +43,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	// Create and start BoxManager
 	boxMgr := boxmgr.New(cfg, monitorCfg)
+	defer boxMgr.Close()
 	monitorStarted := time.Now()
 	if err := boxMgr.EnsureMonitor(ctx); err != nil {
 		return fmt.Errorf("init monitor server: %w", err)
@@ -167,7 +169,6 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		"runtime":     time.Since(runtimeStarted).Milliseconds(),
 		"total":       time.Since(startupStarted).Milliseconds(),
 	})
-	defer boxMgr.Close()
 
 	// Start refresh loop only after the initial sing-box instance is ready.
 	if coreStarted && cfg.SubscriptionRefresh.Enabled && len(cfg.Subscriptions) > 0 {
@@ -175,16 +176,8 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 
 	// Wait for shutdown signal
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-
-	select {
-	case <-ctx.Done():
-		fmt.Println("Context cancelled, initiating graceful shutdown...")
-	case sig := <-sigCh:
-		fmt.Printf("Received %s, initiating graceful shutdown...\n", sig)
-	}
+	<-ctx.Done()
+	fmt.Println("Shutdown requested, initiating graceful shutdown...")
 
 	// Create shutdown context with timeout
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -202,18 +195,11 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 
 	fmt.Println("Stopping box manager...")
-	if err := boxMgr.Close(); err != nil {
+	if err := boxMgr.CloseContext(shutdownCtx); err != nil {
 		fmt.Printf("Error closing box manager: %v\n", err)
 	}
 
-	// Wait for connections to drain
-	fmt.Println("Waiting for connections to drain...")
-	select {
-	case <-time.After(2 * time.Second):
-		fmt.Println("Graceful shutdown completed")
-	case <-shutdownCtx.Done():
-		fmt.Println("Shutdown timeout exceeded, forcing exit")
-	}
+	fmt.Println("Graceful shutdown completed")
 
 	return nil
 }

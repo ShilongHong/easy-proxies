@@ -263,7 +263,15 @@ func newBatchServiceForTest(t *testing.T, mgr *batchNodeManagerStub) (*Service, 
 	if err != nil {
 		t.Fatalf("NewStore() error = %v", err)
 	}
-	return NewService(store, nil, mgr), store
+	svc := NewService(store, nil, mgr)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := svc.Close(ctx); err != nil {
+			t.Errorf("service cleanup: %v", err)
+		}
+	})
+	return svc, store
 }
 
 func waitTestJobTerminal(t *testing.T, svc *Service, jobID string) TestJob {
