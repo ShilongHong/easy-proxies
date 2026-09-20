@@ -2503,7 +2503,7 @@ function renderSettings(){
           <span class="pill" id="exportTagCount">已选 ${esc(S.selectedExportTags.size)} / ${esc(exportTags.length)}</span>
         </div>
         <div class="settings-section-body">
-          <div class="row"><button class="btn small secondary" onclick="setAllExportTags(true)" ${exportTags.length?'':'disabled'}>选择全部 Tag</button><button class="btn small ghost" id="clearExportTags" onclick="setAllExportTags(false)" ${S.selectedExportTags.size?'':'disabled'}>清空选择</button><button class="btn" data-tag-export-selected onclick="exportSelectedTags()" ${S.selectedExportTags.size?'':'disabled'}>导出选中 (${esc(S.selectedExportTags.size)})</button></div>
+          <div class="row"><button class="btn small secondary" onclick="setAllExportTags(true)" ${exportTags.length?'':'disabled'}>选择全部 Tag</button><button class="btn small ghost" id="clearExportTags" onclick="setAllExportTags(false)" ${S.selectedExportTags.size?'':'disabled'}>清空选择</button><button class="btn" data-tag-export-selected onclick="exportSelectedTags()" ${S.selectedExportTags.size?'':'disabled'}>导出选中 (${esc(S.selectedExportTags.size)})</button><button class="btn small secondary" onclick="downloadSub2APIExport('http')">导出 Sub2API JSON</button><button class="btn small secondary" onclick="downloadSub2APIExport('all')">Sub2API HTTP + SOCKS5</button></div>
           ${exportTags.length?`<div class="subscription-export-list">${exportTags.map(group=>`<div class="export-tag-row"><input type="checkbox" data-export-tag data-tag="${esc(group.tag)}" aria-label="选择 ${esc(group.tag)}" ${S.selectedExportTags.has(group.tag)?'checked':''} onchange="toggleExportTag(this.dataset.tag,this.checked)"><div class="export-tag-main"><strong>${esc(group.tag)}</strong><span class="muted">${esc(group.types.join(' / '))} · ${esc(group.total)} 个节点</span></div><button class="btn small secondary" data-tag="${esc(group.tag)}" onclick="exportSourceTags([this.dataset.tag])">导出</button></div>`).join('')}</div>`:'<div class="empty">没有带 Tag 的导入来源</div>'}
         </div>
       </section>
@@ -3130,6 +3130,15 @@ async function downloadExport(){
     const blob=new Blob([text],{type:'text/plain;charset=utf-8'});
     const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='easy-proxies-export.txt';a.click();URL.revokeObjectURL(a.href);
     openDialog('导出完成','<p>已生成导出文件。</p>');
+  }catch(err){openDialog('导出失败',`<p>${esc(err.message)}</p>`)}
+}
+async function downloadSub2APIExport(scheme='http'){
+  const host=prompt('请输入 Sub2API 可访问的代理主机地址（Docker 通常填 172.22.0.1）','172.22.0.1');
+  if(host===null||!host.trim())return;
+  try{
+    const params=new URLSearchParams({format:'sub2api',scheme,host:host.trim()});
+    await downloadResponse('/api/export?'+params.toString());
+    toast('Sub2API JSON 已导出');
   }catch(err){openDialog('导出失败',`<p>${esc(err.message)}</p>`)}
 }
 document.addEventListener('keydown',event=>{

@@ -9,7 +9,62 @@ import (
 	"easy_proxies/internal/outbound/dispatch"
 	poolout "easy_proxies/internal/outbound/pool"
 	"easy_proxies/internal/proxychain"
+
+	"github.com/sagernet/sing-box/option"
 )
+
+func TestBuildMultiPortKeepsEveryPortWhenNamesCollide(t *testing.T) {
+	for _, names := range [][]string{
+		{"mesl-日本", "mesl-香港", "mesl-2"},
+		{"mesl-2", "mesl-日本", "mesl-香港", "mesl-台湾"},
+		{"node", "node", "node-2", "node-2", "node-2-2", "node"},
+	} {
+		t.Run(strings.Join(names, ","), func(t *testing.T) {
+			cfg := &config.Config{Mode: "multi-port", MultiPort: config.MultiPortConfig{Address: "127.0.0.1"}}
+			for i, name := range names {
+				cfg.Nodes = append(cfg.Nodes, config.NodeConfig{Name: name, URI: "http://127.0.0.1:18001", Port: uint16(24000 + i)})
+			}
+			options, err := Build(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			outboundTags := make(map[string]bool)
+			for _, outbound := range options.Outbounds {
+				if outboundTags[outbound.Tag] {
+					t.Fatalf("duplicate outbound tag %q", outbound.Tag)
+				}
+				outboundTags[outbound.Tag] = true
+			}
+			ports := make(map[uint16]bool)
+			inboundTags := make(map[string]bool)
+			for _, inbound := range options.Inbounds {
+				port := inbound.Options.(*option.HTTPMixedInboundOptions).ListenPort
+				if ports[port] || inboundTags[inbound.Tag] {
+					t.Fatalf("duplicate listener: tag=%q port=%d", inbound.Tag, port)
+				}
+				ports[port], inboundTags[inbound.Tag] = true, true
+			}
+			for _, node := range cfg.Nodes {
+				if !ports[node.Port] {
+					t.Errorf("missing port %d", node.Port)
+				}
+			}
+			for _, outbound := range options.Outbounds {
+				if outbound.Type == dispatch.Type {
+					mappings := outbound.Options.(*dispatch.Options).Mappings
+					if len(mappings) != len(names) {
+						t.Fatalf("dispatch mappings = %d, want %d", len(mappings), len(names))
+					}
+					for inbound, target := range mappings {
+						if !inboundTags[inbound] || !outboundTags[target] {
+							t.Fatalf("invalid dispatch mapping %q -> %q", inbound, target)
+						}
+					}
+				}
+			}
+		})
+	}
+}
 
 func TestBuildMultiPortUsesDirectOutboundsAndDispatch(t *testing.T) {
 	cfg := &config.Config{

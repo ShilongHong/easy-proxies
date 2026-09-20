@@ -856,6 +856,8 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 //   - scheme=http   (默认)
 //   - scheme=socks5
 //   - scheme=all    (同时导出 HTTP 和 SOCKS5)
+//   - format=sub2api (导出带节点名称的 Sub2API JSON)
+//   - host=...       (format=sub2api 时覆盖导出主机名)
 //
 // 在 pool/hybrid 模式下，还会导出 Pool 代理池入口和 GeoIP 分区路由入口。
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
@@ -873,6 +875,15 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"error": "invalid scheme, use http/socks5/all"})
 		return
 	}
+	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
+	if format == "" {
+		format = "text"
+	}
+	if format != "text" && format != "sub2api" {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "invalid format, use text/sub2api"})
+		return
+	}
 
 	// 只导出初始检查通过的可用节点
 	snapshots := s.mgr.SnapshotFiltered(true)
@@ -884,13 +895,35 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	s.cfgMu.RLock()
 	mode := ""
 	var listenerCfg config.ListenerConfig
+	var multiPortCfg config.MultiPortConfig
 	var geoipCfg config.GeoIPConfig
 	if s.cfgSrc != nil {
 		mode = s.cfgSrc.Mode
 		listenerCfg = s.cfgSrc.Listener
+		multiPortCfg = s.cfgSrc.MultiPort
 		geoipCfg = s.cfgSrc.GeoIP
 	}
 	s.cfgMu.RUnlock()
+
+	// Direct multi-port outbounds do not register in the legacy pool monitor.
+	// Read assigned runtime ports instead of exporting that empty snapshot.
+	if (mode == "multi-port" || mode == "hybrid") && s.nodeMgr != nil {
+		nodes, err := s.nodeMgr.ListConfigNodes(r.Context())
+		if err != nil {
+			writeAPIError(w, http.StatusInternalServerError, "读取运行端口失败")
+			return
+		}
+		snapshots = make([]Snapshot, 0, len(nodes))
+		for _, node := range nodes {
+			snapshots = append(snapshots, Snapshot{NodeInfo: NodeInfo{
+				Name: node.Name, ListenAddress: multiPortCfg.Address, Port: node.Port,
+			}})
+		}
+	}
+	if format == "sub2api" {
+		s.writeSub2APIExport(w, r, scheme, snapshots, multiPortCfg)
+		return
+	}
 
 	// Pool 代理池入口（pool 或 hybrid 模式）
 	if (mode == "pool" || mode == "hybrid") && listenerCfg.Port > 0 {
@@ -951,9 +984,6 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Multi-port 独立节点
-	if len(snapshots) > 0 && (mode == "hybrid" || mode == "multi-port" || mode == "") {
-		lines = append(lines, "# Multi-port 独立节点")
-	}
 	for _, snap := range snapshots {
 		// 只导出有监听地址和端口的节点
 		if snap.ListenAddress == "" || snap.Port == 0 {
@@ -967,12 +997,17 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		var authPart string
-		if s.cfg.ProxyUsername != "" && s.cfg.ProxyPassword != "" {
-			authPart = fmt.Sprintf("%s:%s@", s.cfg.ProxyUsername, s.cfg.ProxyPassword)
+		username, password := s.cfg.ProxyUsername, s.cfg.ProxyPassword
+		if mode == "multi-port" || mode == "hybrid" {
+			username, password = multiPortCfg.Username, multiPortCfg.Password
 		}
-		httpURI := fmt.Sprintf("http://%s%s:%d", authPart, listenAddr, snap.Port)
-		socksURI := fmt.Sprintf("socks5://%s%s:%d", authPart, listenAddr, snap.Port)
+		proxyURL := neturl.URL{Scheme: "http", Host: net.JoinHostPort(listenAddr, fmt.Sprint(snap.Port))}
+		if username != "" {
+			proxyURL.User = neturl.UserPassword(username, password)
+		}
+		httpURI := proxyURL.String()
+		proxyURL.Scheme = "socks5"
+		socksURI := proxyURL.String()
 
 		switch scheme {
 		case "http":
@@ -1007,6 +1042,79 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
 	_, _ = w.Write([]byte(strings.Join(lines, "\n")))
+}
+
+type sub2APIProxyExport struct {
+	ProxyKey     string `json:"proxy_key"`
+	Name         string `json:"name"`
+	Protocol     string `json:"protocol"`
+	Host         string `json:"host"`
+	Port         uint16 `json:"port"`
+	Status       string `json:"status"`
+	FallbackMode string `json:"fallback_mode"`
+}
+
+type sub2APIExport struct {
+	ExportedAt string               `json:"exported_at"`
+	Proxies    []sub2APIProxyExport `json:"proxies"`
+	Accounts   []any                `json:"accounts"`
+}
+
+func (s *Server) writeSub2APIExport(w http.ResponseWriter, r *http.Request, scheme string, snapshots []Snapshot, multiPortCfg config.MultiPortConfig) {
+	hostOverride := strings.TrimSpace(r.URL.Query().Get("host"))
+	if hostOverride == "" {
+		hostOverride = strings.TrimSpace(multiPortCfg.Address)
+		if hostOverride == "" || hostOverride == "0.0.0.0" || hostOverride == "::" || hostOverride == "[::]" {
+			if extIP, _, _, _ := s.getSettings(); extIP != "" {
+				hostOverride = extIP
+			}
+		}
+	}
+	if hostOverride == "" {
+		writeAPIError(w, http.StatusBadRequest, "没有可导出的代理主机地址，请设置 external_ip 或传入 host 参数")
+		return
+	}
+	username, password := s.cfg.ProxyUsername, s.cfg.ProxyPassword
+	if multiPortCfg.Address != "" || multiPortCfg.BasePort != 0 {
+		username, password = multiPortCfg.Username, multiPortCfg.Password
+	}
+	protocols := []string{scheme}
+	if scheme == "all" {
+		protocols = []string{"http", "socks5"}
+	}
+	result := sub2APIExport{
+		ExportedAt: time.Now().UTC().Format(time.RFC3339),
+		Proxies:    make([]sub2APIProxyExport, 0, len(snapshots)*len(protocols)),
+		Accounts:   []any{},
+	}
+	for _, snap := range snapshots {
+		if strings.TrimSpace(snap.Name) == "" || snap.Port == 0 {
+			continue
+		}
+		for _, protocol := range protocols {
+			result.Proxies = append(result.Proxies, sub2APIProxyExport{
+				ProxyKey:     fmt.Sprintf("%s|%s|%d|%s|%s", protocol, hostOverride, snap.Port, username, password),
+				Name:         snap.Name,
+				Protocol:     protocol,
+				Host:         hostOverride,
+				Port:         snap.Port,
+				Status:       "active",
+				FallbackMode: "none",
+			})
+		}
+	}
+	if len(result.Proxies) == 0 {
+		writeAPIError(w, http.StatusBadRequest, "没有可导出的代理")
+		return
+	}
+	data, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "生成 Sub2API 导出失败")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", "attachment; filename=sub2api-proxies.json")
+	_, _ = w.Write(append(data, '\n'))
 }
 
 // handleSettings handles GET/PUT for dynamic settings (external_ip, probe_target, skip_cert_verify, log).

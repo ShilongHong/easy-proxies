@@ -114,14 +114,14 @@ func Build(cfg *config.Config) (option.Options, error) {
 			baseTag = fmt.Sprintf("node-%d", len(memberTags)+1)
 		}
 
-		// Ensure tag uniqueness by appending a counter if needed
+		// Check every candidate against all allocated tags, including suffixes
+		// generated for earlier names (e.g. "node", "node", "node-2").
 		tag := baseTag
-		if count, exists := usedTags[baseTag]; exists {
-			usedTags[baseTag] = count + 1
-			tag = fmt.Sprintf("%s-%d", baseTag, count+1)
-		} else {
-			usedTags[baseTag] = 1
+		for suffix := usedTags[baseTag] + 1; usedTags[tag] != 0; suffix++ {
+			tag = fmt.Sprintf("%s-%d", baseTag, suffix)
+			usedTags[baseTag] = suffix
 		}
+		usedTags[tag] = 1
 
 		outbound, err := buildNodeOutbound(tag, node.URI, cfg.SkipCertVerify)
 		if err != nil {
